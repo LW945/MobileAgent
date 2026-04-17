@@ -125,7 +125,7 @@ def execute_action(computer_tools, action_parameter):
     elif action_type == "type":
         computer_tools.type(action_parameter["text"])
 
-    elif action_type == "drag":
+    elif action_type in ("drag", "left_click_drag"):
         computer_tools.left_click_drag(
             action_parameter["coordinate"][0],
             action_parameter["coordinate"][1],
@@ -138,6 +138,14 @@ def execute_action(computer_tools, action_parameter):
                 action_parameter["coordinate"][1],
             )
         computer_tools.scroll(action_parameter.get("pixels", 1))
+
+    elif action_type == "hscroll":
+        if "coordinate" in action_parameter:
+            computer_tools.mouse_move(
+                action_parameter["coordinate"][0],
+                action_parameter["coordinate"][1],
+            )
+        computer_tools.hscroll(action_parameter.get("pixels", 1))
 
     elif action_type in ("computer_double_click", "double_click"):
         computer_tools.double_click(
@@ -205,12 +213,46 @@ def execute_action(computer_tools, action_parameter):
     return False  # continue execution
 
 
+def extract_reasoning_content(raw_response):
+    """Best-effort extraction of reasoning text from an OpenAI-compatible response."""
+    if raw_response is None:
+        return None
+
+    try:
+        message = raw_response.choices[0].message
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+
+    thought = getattr(message, "reasoning_content", None)
+    if thought:
+        return thought
+
+    reasoning = getattr(message, "reasoning", None)
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+
+    if isinstance(reasoning, list):
+        parts = []
+        for item in reasoning:
+            if isinstance(item, dict):
+                text = item.get("text")
+            else:
+                text = getattr(item, "text", None)
+            if text:
+                parts.append(text)
+        if parts:
+            return "\n".join(parts)
+
+    return None
+
+
 def main():
     args = parse_args()
 
     # Initialize tools
     computer_tools = ComputerTools()
     computer_tools.reset()
+    vllm = GUIOwlWrapper(args.api_key, args.base_url, args.model)
 
     # Prepare output directory
     output_dir = get_output_dir()
@@ -236,26 +278,10 @@ def main():
             screen_shot, args.instruction, history, args.model
         )
 
-        # ====== vllm ======
-        vllm = GUIOwlWrapper(args.api_key, args.base_url, args.model)
-        output_text, _, _ = vllm.predict_mm(messages)
-
-
-        # ======= dash =======
-        response = dashscope.MultiModalConversation.call(
-            model=args.model,
-            messages=messages,
-            vl_high_resolution_images=True,
-            stream=False,
-        )
-
-        print(f"Request ID: {response.get('request_id', 'N/A')}")
-
-        output_text = response.output.choices[0].message.content[0]["text"]
-        # ======= dash =======
+        output_text, _, raw_response = vllm.predict_mm(messages)
 
         # Prepend reasoning content if present
-        thought = response.output.choices[0].message.reasoning_content
+        thought = extract_reasoning_content(raw_response)
         if thought:
             output_text = f"<thinking>\n{thought}\n</thinking>{output_text}"
 

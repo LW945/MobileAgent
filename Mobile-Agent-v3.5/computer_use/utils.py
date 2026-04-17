@@ -199,6 +199,21 @@ class ComputerTools:
         """
         pyautogui.scroll(pixels)
 
+    def hscroll(self, pixels):
+        """
+        Horizontally scroll the mouse wheel when supported.
+        Fall back to Shift+scroll for environments without native support.
+        """
+        if hasattr(pyautogui, "hscroll"):
+            pyautogui.hscroll(pixels)
+            return
+
+        pyautogui.keyDown("shift")
+        try:
+            pyautogui.scroll(pixels)
+        finally:
+            pyautogui.keyUp("shift")
+
 
 # ---------------------------------------------------------------------------
 # Step popup (blocking, with countdown)
