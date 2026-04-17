@@ -736,10 +736,12 @@ def pil_to_base64(image):
     image.save(buffer, format="PNG") 
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-def image_to_base64(image_path):
+def encode_image_for_request(image_path):
     if image_path.startswith("file://"):
         image_path = image_path[7:]
+    original_file_bytes = os.path.getsize(image_path)
     dummy_image = Image.open(image_path)
+    original_width, original_height = dummy_image.size
     MIN_PIXELS=3136
     MAX_PIXELS=10035200
     resized_height, resized_width  = smart_resize(dummy_image.height,
@@ -748,7 +750,29 @@ def image_to_base64(image_path):
         min_pixels=MIN_PIXELS,
         max_pixels=MAX_PIXELS,)
     dummy_image = dummy_image.resize((resized_width, resized_height))
-    return f"data:image/png;base64,{pil_to_base64(dummy_image)}"
+    buffer = BytesIO()
+    dummy_image.save(buffer, format="PNG")
+    png_bytes = buffer.getvalue()
+    base64_payload = base64.b64encode(png_bytes).decode("utf-8")
+    return (
+        f"data:image/png;base64,{base64_payload}",
+        {
+            "source_path": image_path,
+            "original_file_bytes": original_file_bytes,
+            "original_width": original_width,
+            "original_height": original_height,
+            "payload_file_bytes": len(png_bytes),
+            "payload_png_bytes": len(png_bytes),
+            "payload_base64_chars": len(base64_payload),
+            "resized_width": resized_width,
+            "resized_height": resized_height,
+        },
+    )
+
+
+def image_to_base64(image_path):
+    encoded_image, _ = encode_image_for_request(image_path)
+    return encoded_image
 
 class LlmWrapper(abc.ABC):
     """Abstract interface for (text only) LLM."""
@@ -859,6 +883,10 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
           "image_count": 0,
           "text_chars": 0,
           "image_base64_chars": 0,
+          "image_original_file_bytes": 0,
+          "image_payload_file_bytes": 0,
+          "image_payload_png_bytes": 0,
+          "image_details": [],
       }
       for message in messages:
           new_content = []
@@ -869,9 +897,13 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
                   stats["text_chars"] += len(text)
                   new_content.append({'type': 'text', 'text': text})
               elif list(item.keys())[0] == 'image':
-                  encoded_image = image_to_base64(item['image'])
+                  encoded_image, image_stats = encode_image_for_request(item['image'])
                   stats["image_count"] += 1
-                  stats["image_base64_chars"] += len(encoded_image)
+                  stats["image_base64_chars"] += image_stats["payload_base64_chars"]
+                  stats["image_original_file_bytes"] += image_stats["original_file_bytes"]
+                  stats["image_payload_file_bytes"] += image_stats["payload_file_bytes"]
+                  stats["image_payload_png_bytes"] += image_stats["payload_png_bytes"]
+                  stats["image_details"].append(image_stats)
                   new_content.append({'type': 'image_url', 'image_url': {'url': encoded_image}})
           converted_messages.append({'role': message['role'], 'content': new_content})
 
@@ -910,6 +942,10 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
                 image_count=payload_stats["image_count"],
                 text_chars=payload_stats["text_chars"],
                 image_base64_chars=payload_stats["image_base64_chars"],
+                image_original_file_bytes=payload_stats["image_original_file_bytes"],
+                image_payload_file_bytes=payload_stats["image_payload_file_bytes"],
+                image_payload_png_bytes=payload_stats["image_payload_png_bytes"],
+                image_details=payload_stats["image_details"],
                 payload_prepare_seconds=payload_prepare_seconds,
                 context=request_context,
             )

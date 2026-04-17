@@ -313,10 +313,28 @@ def emit_vllm_request_log(
         overall_request_stats["payload_prepare_seconds"] += record.get(
             "payload_prepare_seconds", 0.0
         )
+        overall_request_stats["image_original_file_bytes"] += record.get(
+            "image_original_file_bytes", 0
+        )
+        overall_request_stats["image_payload_file_bytes"] += record.get(
+            "image_payload_file_bytes", 0
+        )
+        overall_request_stats["image_payload_png_bytes"] += record.get(
+            "image_payload_png_bytes", 0
+        )
         if step_id is not None:
             step_request_stats[step_id]["send_count"] += 1
             step_request_stats[step_id]["payload_prepare_seconds"] += record.get(
                 "payload_prepare_seconds", 0.0
+            )
+            step_request_stats[step_id]["image_original_file_bytes"] += record.get(
+                "image_original_file_bytes", 0
+            )
+            step_request_stats[step_id]["image_payload_file_bytes"] += record.get(
+                "image_payload_file_bytes", 0
+            )
+            step_request_stats[step_id]["image_payload_png_bytes"] += record.get(
+                "image_payload_png_bytes", 0
             )
     elif record["phase"] == "receive":
         overall_request_stats["receive_count"] += 1
@@ -342,6 +360,9 @@ def emit_vllm_request_log(
         summary += (
             f" messages={record.get('message_count')} "
             f"images={record.get('image_count')} "
+            f"source_bytes={record.get('image_original_file_bytes')} "
+            f"payload_file_bytes={record.get('image_payload_file_bytes')} "
+            f"payload_png_bytes={record.get('image_payload_png_bytes')} "
             f"prepare={record.get('payload_prepare_seconds')}s"
         )
     else:
@@ -357,6 +378,22 @@ def emit_vllm_request_log(
     if step_id is not None:
         summary += f" step={step_id}"
     print(summary)
+    if record["phase"] == "send":
+        for image_index, image_info in enumerate(record.get("image_details", [])):
+            print(
+                "[VLLM IMAGE] "
+                f"req={record['request_index']} "
+                f"attempt={record['attempt']} "
+                f"step={step_id} "
+                f"idx={image_index} "
+                f"file={os.path.basename(image_info['source_path'])} "
+                f"original_bytes={image_info['original_file_bytes']} "
+                f"payload_file_bytes={image_info['payload_file_bytes']} "
+                f"payload_png_bytes={image_info['payload_png_bytes']} "
+                f"base64_chars={image_info['payload_base64_chars']} "
+                f"original_size={image_info['original_width']}x{image_info['original_height']} "
+                f"resized_size={image_info['resized_width']}x{image_info['resized_height']}"
+            )
     if record.get("error"):
         print(f"[VLLM ERROR] {record['error']}")
 
@@ -732,6 +769,9 @@ def main():
                     f"receive={int(request_profile.get('receive_count', 0))} "
                     f"payload_prepare={request_profile.get('payload_prepare_seconds', 0.0)}s "
                     f"network_latency={request_profile.get('network_latency_seconds', 0.0)}s "
+                    f"source_bytes={int(request_profile.get('image_original_file_bytes', 0))} "
+                    f"payload_file_bytes={int(request_profile.get('image_payload_file_bytes', 0))} "
+                    f"payload_png_bytes={int(request_profile.get('image_payload_png_bytes', 0))} "
                     f"errors={int(request_profile.get('error_count', 0))}"
                 )
             if slowest_step:
