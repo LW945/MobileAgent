@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+from collections import defaultdict
 from datetime import datetime
 import json
 import os
@@ -258,18 +259,104 @@ def append_task_log(log_path, record):
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def emit_vllm_request_log(
+    log_path,
+    instruction,
+    event,
+    overall_request_stats,
+    step_request_stats,
+):
+    """Persist, print, and aggregate one structured vLLM request event."""
+    record = {
+        "instruction": instruction,
+        "log_path": log_path,
+        **event,
+    }
+    append_task_log(log_path, record)
+
+    context = record.get("context") or {}
+    step_id = context.get("step_id")
+
+    if record["phase"] == "send":
+        overall_request_stats["send_count"] += 1
+        overall_request_stats["payload_prepare_seconds"] += record.get(
+            "payload_prepare_seconds", 0.0
+        )
+        if step_id is not None:
+            step_request_stats[step_id]["send_count"] += 1
+            step_request_stats[step_id]["payload_prepare_seconds"] += record.get(
+                "payload_prepare_seconds", 0.0
+            )
+    elif record["phase"] == "receive":
+        overall_request_stats["receive_count"] += 1
+        overall_request_stats["network_latency_seconds"] += record.get(
+            "latency_seconds", 0.0
+        )
+        if record.get("status") == "error":
+            overall_request_stats["error_count"] += 1
+        if step_id is not None:
+            step_request_stats[step_id]["receive_count"] += 1
+            step_request_stats[step_id]["network_latency_seconds"] += record.get(
+                "latency_seconds", 0.0
+            )
+            if record.get("status") == "error":
+                step_request_stats[step_id]["error_count"] += 1
+
+    prefix = f"[VLLM {record['phase'].upper()}]"
+    summary = (
+        f"{prefix} t={record['timestamp']} req={record['request_index']} "
+        f"attempt={record['attempt']}"
+    )
+    if record["phase"] == "send":
+        summary += (
+            f" messages={record.get('message_count')} "
+            f"images={record.get('image_count')} "
+            f"prepare={record.get('payload_prepare_seconds')}s"
+        )
+    else:
+        summary += (
+            f" status={record.get('status')} "
+            f"latency={record.get('latency_seconds')}s"
+        )
+        response_id = record.get("response_id")
+        if response_id:
+            summary += f" response_id={response_id}"
+        if record.get("will_retry") is not None:
+            summary += f" will_retry={record['will_retry']}"
+    if step_id is not None:
+        summary += f" step={step_id}"
+    print(summary)
+    if record.get("error"):
+        print(f"[VLLM ERROR] {record['error']}")
+
+
 def main():
     args = parse_args()
 
     # Initialize tools
     computer_tools = ComputerTools()
     computer_tools.reset()
-    vllm = GUIOwlWrapper(args.api_key, args.base_url, args.model)
 
     # Prepare output directory
     output_dir = get_output_dir()
     safe_instruction = sanitize_filename(args.instruction)
     task_log_path = os.path.join(output_dir, "task_runs.jsonl")
+    request_log_path = os.path.join(output_dir, "vllm_requests.jsonl")
+
+    overall_request_stats = defaultdict(float)
+    step_request_stats = defaultdict(lambda: defaultdict(float))
+    vllm = GUIOwlWrapper(
+        args.api_key,
+        args.base_url,
+        args.model,
+        request_logger=lambda event: emit_vllm_request_log(
+            request_log_path,
+            args.instruction,
+            event,
+            overall_request_stats,
+            step_request_stats,
+        ),
+    )
 
     history = []
     stop_flag = False
@@ -280,6 +367,7 @@ def main():
 
     print(f"[TASK START] {task_start_time}")
     print(f"[TASK LOG] {task_log_path}")
+    print(f"[VLLM REQUEST LOG] {request_log_path}")
 
     try:
         for step_id in range(args.max_steps):
@@ -299,7 +387,10 @@ def main():
                 screen_shot, args.instruction, history, args.model
             )
 
-            output_text, _, raw_response = vllm.predict_mm(messages)
+            output_text, _, raw_response = vllm.predict_mm(
+                messages,
+                request_context={"step_id": step_id},
+            )
 
             # Prepend reasoning content if present
             thought = extract_reasoning_content(raw_response)
@@ -364,6 +455,7 @@ def main():
             "model": args.model,
             "base_url": args.base_url,
             "output_dir": output_dir,
+            "request_log_path": request_log_path,
             "start_time": task_start_time,
             "end_time": task_end_time,
             "elapsed_seconds": elapsed_seconds,

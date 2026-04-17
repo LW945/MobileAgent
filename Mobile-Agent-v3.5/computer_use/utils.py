@@ -10,9 +10,10 @@ import abc
 import base64
 import numpy as np
 import httpx
+from datetime import datetime
 from io import BytesIO
 from openai import OpenAI
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import pyautogui
@@ -786,6 +787,11 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
     RETRY_WAITING_SECONDS = 20
 
     @staticmethod
+    def _log_timestamp() -> str:
+        """Return a local timezone-aware timestamp for request logs."""
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    @staticmethod
     def _should_bypass_env_proxy(base_url: str) -> bool:
         """
         Ignore environment proxy settings for loopback model endpoints.
@@ -805,6 +811,7 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
             model_name: str,
             max_retry: int = 10,
             temperature: float = 0.0,
+            request_logger: Optional[Callable[[dict], None]] = None,
     ):
         if max_retry <= 0:
             max_retry = 10
@@ -812,6 +819,9 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
         self.max_retry = min(max_retry, 10)
         self.temperature = temperature
         self.model = model_name
+        self.base_url = base_url
+        self.request_logger = request_logger
+        self.request_counter = 0
         self._http_client = None
 
         client_kwargs = {
@@ -827,42 +837,117 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
             **client_kwargs
         )
 
+    def _emit_request_event(self, phase: str, **event):
+        """Emit a structured request log event if a logger is configured."""
+        if not self.request_logger:
+            return
+
+        record = {
+            "timestamp": self._log_timestamp(),
+            "phase": phase,
+            "model": self.model,
+            "base_url": self.base_url,
+        }
+        record.update(event)
+        self.request_logger(record)
+
     def convert_messages_format_to_openaiurl(self, messages):
       converted_messages = []
+      stats = {
+          "message_count": len(messages),
+          "text_item_count": 0,
+          "image_count": 0,
+          "text_chars": 0,
+          "image_base64_chars": 0,
+      }
       for message in messages:
           new_content = []
           for item in message['content']:
               if list(item.keys())[0] == 'text':
-                  new_content.append({'type': 'text', 'text': item['text']})
+                  text = item['text']
+                  stats["text_item_count"] += 1
+                  stats["text_chars"] += len(text)
+                  new_content.append({'type': 'text', 'text': text})
               elif list(item.keys())[0] == 'image':
-                new_content.append({'type': 'image_url', 'image_url': {'url': image_to_base64(item['image'])}})
+                  encoded_image = image_to_base64(item['image'])
+                  stats["image_count"] += 1
+                  stats["image_base64_chars"] += len(encoded_image)
+                  new_content.append({'type': 'image_url', 'image_url': {'url': encoded_image}})
           converted_messages.append({'role': message['role'], 'content': new_content})
 
-      return converted_messages
+      return converted_messages, stats
     
     def predict(
             self,
             text_prompt: str,
     ) -> tuple[str, Optional[bool], Any]:
-        return self.predict_mm(text_prompt, [])
+        return self.predict_mm(
+            [{"role": "user", "content": [{"text": text_prompt}]}]
+        )
 
     def predict_mm(
-            self, messages = None
+            self, messages = None, request_context: Optional[dict] = None
     ) -> tuple[str, Optional[bool], Any]:
-        
-        payload = messages
-        payload = self.convert_messages_format_to_openaiurl(payload)
+        payload_source = messages
+        prepare_started_at = time.monotonic()
+        payload, payload_stats = self.convert_messages_format_to_openaiurl(payload_source)
+        payload_prepare_seconds = round(time.monotonic() - prepare_started_at, 3)
+        request_context = request_context or {}
+        self.request_counter += 1
+        request_index = self.request_counter
 
         counter = self.max_retry
         wait_seconds = self.RETRY_WAITING_SECONDS
+        attempt = 1
         while counter > 0:
+            request_started_at = time.monotonic()
+            self._emit_request_event(
+                "send",
+                request_index=request_index,
+                attempt=attempt,
+                message_count=payload_stats["message_count"],
+                text_item_count=payload_stats["text_item_count"],
+                image_count=payload_stats["image_count"],
+                text_chars=payload_stats["text_chars"],
+                image_base64_chars=payload_stats["image_base64_chars"],
+                payload_prepare_seconds=payload_prepare_seconds,
+                context=request_context,
+            )
             try:
-              chat_completion_from_url = self.bot.chat.completions.create(model=self.model, messages=payload, **{})
-              return (chat_completion_from_url.choices[0].message.content, payload, chat_completion_from_url)
+                chat_completion_from_url = self.bot.chat.completions.create(
+                    model=self.model,
+                    messages=payload,
+                    **{},
+                )
+                self._emit_request_event(
+                    "receive",
+                    request_index=request_index,
+                    attempt=attempt,
+                    status="success",
+                    latency_seconds=round(time.monotonic() - request_started_at, 3),
+                    response_id=getattr(chat_completion_from_url, "id", None),
+                    context=request_context,
+                )
+                return (
+                    chat_completion_from_url.choices[0].message.content,
+                    payload,
+                    chat_completion_from_url,
+                )
             except Exception as e:
+                self._emit_request_event(
+                    "receive",
+                    request_index=request_index,
+                    attempt=attempt,
+                    status="error",
+                    latency_seconds=round(time.monotonic() - request_started_at, 3),
+                    error=repr(e),
+                    will_retry=counter > 1,
+                    context=request_context,
+                )
                 time.sleep(wait_seconds)
                 wait_seconds *= 1
                 counter -= 1
+                attempt += 1
                 print('Error calling LLM, will retry soon...')
                 print(e)
         return ERROR_CALLING_LLM, None, None
