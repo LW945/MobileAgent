@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+from datetime import datetime
 import json
 import os
 import time
@@ -246,6 +247,17 @@ def extract_reasoning_content(raw_response):
     return None
 
 
+def current_timestamp():
+    """Return a local timezone-aware timestamp suitable for logs."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def append_task_log(log_path, record):
+    """Append one task record as JSONL."""
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def main():
     args = parse_args()
 
@@ -257,77 +269,116 @@ def main():
     # Prepare output directory
     output_dir = get_output_dir()
     safe_instruction = sanitize_filename(args.instruction)
+    task_log_path = os.path.join(output_dir, "task_runs.jsonl")
 
     history = []
     stop_flag = False
+    task_status = "running"
+    error_message = None
+    task_start_time = current_timestamp()
+    task_start_monotonic = time.monotonic()
 
-    for step_id in range(args.max_steps):
-        if stop_flag:
-            break
+    print(f"[TASK START] {task_start_time}")
+    print(f"[TASK LOG] {task_log_path}")
 
-        print(f"\nSTEP {step_id}:\n{'=' * 50}")
-
-        # Capture screenshot
-        screen_shot = os.path.join(output_dir, f"{safe_instruction}_{step_id}.png")
-        if not computer_tools.get_screenshot(screen_shot):
-            print(f"[ERROR] Failed to capture screenshot at step {step_id}")
-            continue
-
-        # Build messages and call the VLM
-        messages = build_messages(
-            screen_shot, args.instruction, history, args.model
-        )
-
-        output_text, _, raw_response = vllm.predict_mm(messages)
-
-        # Prepend reasoning content if present
-        thought = extract_reasoning_content(raw_response)
-        if thought:
-            output_text = f"<thinking>\n{thought}\n</thinking>{output_text}"
-
-        print(output_text)
-
-        # Extract and execute tool calls
-        action_list = extract_tool_calls(output_text)
-
-        dummy_image = Image.open(screen_shot)
-        resized_height, resized_width = smart_resize(
-            dummy_image.height,
-            dummy_image.width,
-            factor=16,
-            min_pixels=3136,
-            max_pixels=1003520 * 200,
-        )
-
-        for action_id, action in enumerate(action_list):
-            action_parameter = action["arguments"]
-
-            # Rescale normalized coordinates to actual pixels
-            rescale_coordinates(action_parameter, resized_width, resized_height)
-
-            # Execute the action
-            should_stop = execute_action(computer_tools, action_parameter)
-
-            if should_stop:
-                stop_flag = True
+    try:
+        for step_id in range(args.max_steps):
+            if stop_flag:
                 break
 
-            # Annotate screenshot for debugging / visualization
-            anno_path = annotate_screenshot(
-                screen_shot,
-                action_parameter,
-                os.path.join(
-                    output_dir,
-                    f"anno_{safe_instruction}_{step_id}_{action_id}.png",
-                ),
+            print(f"\nSTEP {step_id}:\n{'=' * 50}")
+
+            # Capture screenshot
+            screen_shot = os.path.join(output_dir, f"{safe_instruction}_{step_id}.png")
+            if not computer_tools.get_screenshot(screen_shot):
+                print(f"[ERROR] Failed to capture screenshot at step {step_id}")
+                continue
+
+            # Build messages and call the VLM
+            messages = build_messages(
+                screen_shot, args.instruction, history, args.model
             )
 
-        # Record history
-        history.append({"output": output_text, "image": screen_shot})
-        time.sleep(2)
+            output_text, _, raw_response = vllm.predict_mm(messages)
 
-    if not stop_flag:
-        print(f"\n[INFO] Reached maximum steps ({args.max_steps}). Stopping.")
+            # Prepend reasoning content if present
+            thought = extract_reasoning_content(raw_response)
+            if thought:
+                output_text = f"<thinking>\n{thought}\n</thinking>{output_text}"
+
+            print(output_text)
+
+            # Extract and execute tool calls
+            action_list = extract_tool_calls(output_text)
+
+            dummy_image = Image.open(screen_shot)
+            resized_height, resized_width = smart_resize(
+                dummy_image.height,
+                dummy_image.width,
+                factor=16,
+                min_pixels=3136,
+                max_pixels=1003520 * 200,
+            )
+
+            for action_id, action in enumerate(action_list):
+                action_parameter = action["arguments"]
+
+                # Rescale normalized coordinates to actual pixels
+                rescale_coordinates(action_parameter, resized_width, resized_height)
+
+                # Execute the action
+                should_stop = execute_action(computer_tools, action_parameter)
+
+                if should_stop:
+                    stop_flag = True
+                    task_status = "completed"
+                    break
+
+                # Annotate screenshot for debugging / visualization
+                annotate_screenshot(
+                    screen_shot,
+                    action_parameter,
+                    os.path.join(
+                        output_dir,
+                        f"anno_{safe_instruction}_{step_id}_{action_id}.png",
+                    ),
+                )
+
+            # Record history
+            history.append({"output": output_text, "image": screen_shot})
+            time.sleep(2)
+
+        if not stop_flag:
+            task_status = "max_steps_reached"
+            print(f"\n[INFO] Reached maximum steps ({args.max_steps}). Stopping.")
+
+    except Exception as exc:
+        task_status = "failed"
+        error_message = repr(exc)
+        raise
+    finally:
+        task_end_time = current_timestamp()
+        elapsed_seconds = round(time.monotonic() - task_start_monotonic, 3)
+        task_record = {
+            "instruction": args.instruction,
+            "model": args.model,
+            "base_url": args.base_url,
+            "output_dir": output_dir,
+            "start_time": task_start_time,
+            "end_time": task_end_time,
+            "elapsed_seconds": elapsed_seconds,
+            "status": task_status,
+            "steps_recorded": len(history),
+            "log_path": task_log_path,
+        }
+        if error_message:
+            task_record["error"] = error_message
+
+        append_task_log(task_log_path, task_record)
+        print(f"\n[TASK END] {task_end_time}")
+        print(f"[TASK STATUS] {task_status}")
+        print(f"[TASK DURATION] {elapsed_seconds}s")
+        print(f"[TASK LOGGED TO] {task_log_path}")
 
 
 if __name__ == "__main__":
