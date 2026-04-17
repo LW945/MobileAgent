@@ -9,9 +9,11 @@ import time
 import abc
 import base64
 import numpy as np
+import httpx
 from io import BytesIO
 from openai import OpenAI
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import pyautogui
 import pyperclip
@@ -783,6 +785,19 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
 
     RETRY_WAITING_SECONDS = 20
 
+    @staticmethod
+    def _should_bypass_env_proxy(base_url: str) -> bool:
+        """
+        Ignore environment proxy settings for loopback model endpoints.
+        This avoids proxy-related failures for local OpenAI-compatible servers.
+        """
+        try:
+            hostname = urlparse(base_url).hostname
+        except ValueError:
+            return False
+
+        return hostname in {"127.0.0.1", "localhost", "::1"}
+
     def __init__(
             self,
             api_key: str,
@@ -797,10 +812,19 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
         self.max_retry = min(max_retry, 10)
         self.temperature = temperature
         self.model = model_name
+        self._http_client = None
+
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "timeout": 30,
+        }
+        if self._should_bypass_env_proxy(base_url):
+            self._http_client = httpx.Client(trust_env=False)
+            client_kwargs["http_client"] = self._http_client
+
         self.bot = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=30
+            **client_kwargs
         )
 
     def convert_messages_format_to_openaiurl(self, messages):
@@ -842,4 +866,3 @@ class GUIOwlWrapper(LlmWrapper, MultimodalLlmWrapper):
                 print('Error calling LLM, will retry soon...')
                 print(e)
         return ERROR_CALLING_LLM, None, None
-
